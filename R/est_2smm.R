@@ -159,8 +159,19 @@ set_partitions_no_singletons <- function(n) {
 
 
 # Compute the joint moment E[prod_l e_{idx[l]}] for measurement error e = W * eps
-# using the moment-cumulant formula (set partitions with no singletons since
-# kappa_1(e) = 0 for Bartlett scores centered at 0)
+# using the recursive multivariate moment-cumulant formula.
+#
+# Since kappa_1(e) = 0 for Bartlett scores (centered), we use:
+#   M(S) = SUM over subsets B of S\{first} with |B| >= 1:
+#            C(|S|-2, |B|-1) * cum({first} ∪ B) * M(S \ B \ {first})
+#            [then add the all-in-one-block term: cum(S)]
+#
+# More precisely, this is the standard recursion:
+#   mu(S) = SUM_{B: first in B, |B| >= 2} C(|S|-2, |B|-2) * cum(B) * mu(S \ B)
+#
+# This avoids explicit set-partition enumeration (which is super-exponential).
+# With memoization on subsets this is O(3^n) worst case, much better than
+# enumerating all partitions for n >= 10.
 #
 # idx_vec: integer vector of factor indices (e.g., c(1,1,3) for e_1*e_1*e_3)
 # W: q x p weight matrix
@@ -170,37 +181,81 @@ compute_error_joint_moment <- function(idx_vec, W, eps_cumulants) {
   if (n == 0) return(1)
   if (n == 1) return(0)  # E[e_a] = 0
 
-  partitions <- set_partitions_no_singletons(n)
-  if (length(partitions) == 0) return(0)
-
   p <- ncol(W)
-  total <- 0
 
-  for (partition in partitions) {
-    # Product over blocks
-    block_prod <- 1
-    for (block in partition) {
-      k <- length(block)
-      if (k > length(eps_cumulants) || is.null(eps_cumulants[[k]])) {
-        # Cumulant not available; treat as 0
-        block_prod <- 0
-        break
-      }
-      kappa_k <- eps_cumulants[[k]]  # p-vector of k-th cumulants
-      # Joint cumulant of (e_{idx[b1]}, ..., e_{idx[bk]}) =
-      # sum_j prod_{l in block} W[idx[l], j] * kappa_k[j]
-      factor_indices <- idx_vec[block]
-      # Compute W-product for each indicator j
-      w_prod <- rep(1, p)
-      for (fi in factor_indices) {
-        w_prod <- w_prod * W[fi, ]
-      }
-      block_prod <- block_prod * sum(w_prod * kappa_k)
-    }
-    total <- total + block_prod
+  # Precompute W rows for each factor index used
+  # W_rows[[i]] is the i-th row of W (a p-vector)
+  # We use integer positions in idx_vec as keys
+  unique_fi <- unique(idx_vec)
+  W_rows <- list()
+  for (fi in unique_fi) {
+    W_rows[[as.character(fi)]] <- W[fi, ]
   }
 
-  total
+  # Helper: compute joint cumulant cum(e_{idx[positions]})
+  # = sum_j prod_{l in positions} W[idx[l], j] * kappa_{|positions|}[j]
+  joint_cum <- function(positions) {
+    k <- length(positions)
+    if (k < 2) return(0)  # kappa_1 = 0
+    if (k > length(eps_cumulants) || is.null(eps_cumulants[[k]])) return(0)
+    kappa_k <- eps_cumulants[[k]]
+    w_prod <- rep(1, p)
+    for (pos in positions) {
+      w_prod <- w_prod * W_rows[[as.character(idx_vec[pos])]]
+    }
+    sum(w_prod * kappa_k)
+  }
+
+  # Memoized recursive moment computation
+  # Elements is an integer vector of positions into idx_vec
+  memo_env <- new.env(hash = TRUE, parent = emptyenv())
+
+  rec_moment <- function(elems) {
+    ne <- length(elems)
+    if (ne == 0) return(1)
+    if (ne == 1) return(0)  # kappa_1 = 0
+
+    key <- paste(elems, collapse = ",")
+    if (exists(key, envir = memo_env)) return(get(key, envir = memo_env))
+
+    first <- elems[1]
+    rest <- elems[-1]
+    nr <- length(rest)
+
+    total <- 0
+
+    # Enumerate subsets B_rest of rest with |B_rest| >= 1
+    # Block = {first} union B_rest, so block size >= 2
+    for (bsize_rest in seq_len(nr)) {
+      # Remainder after removing B_rest from rest must be 0 or >= 2
+      remainder_size <- nr - bsize_rest
+      if (remainder_size == 1) next  # can't form partition with singleton remainder
+
+      combos <- utils::combn(nr, bsize_rest, simplify = FALSE)
+      for (combo_idx in combos) {
+        block_positions <- c(first, rest[combo_idx])
+        remaining <- rest[-combo_idx]
+
+        # Joint cumulant of the block
+        jc <- joint_cum(block_positions)
+        if (abs(jc) < 1e-30) next
+
+        # Combinatorial coefficient: C(ne-2, bsize_rest-1)
+        # This counts the number of ways to reach this partition ordering
+        coeff <- choose(ne - 2L, bsize_rest - 1L)
+
+        # Recursive moment of the remaining elements
+        m_rem <- rec_moment(remaining)
+
+        total <- total + coeff * jc * m_rem
+      }
+    }
+
+    assign(key, total, envir = memo_env)
+    total
+  }
+
+  rec_moment(seq_len(n))
 }
 
 
@@ -307,6 +362,18 @@ estimateErrorMoments <- function(W, Lambda, Theta, v, factor_names,
   # v = C * epsilon where C = I_p - Lambda %*% W
   C_mat <- diag(p) - Lambda %*% W
 
+  # Proactive check: C has rank p - q, so C^k may be rank-deficient.
+  # OLS for kappa_k solves a p x p system with design A_k = C^k.
+  # When p - q < q (i.e., fewer than ~3 indicators per factor on average),
+  # the system is likely underdetermined and kappa_k estimation will fail.
+  if (p <= 2 * q) {
+    warning2("Too few indicators for non-normal cumulant estimation ",
+             "(", p, " indicators, ", q, " factors; need p >= 2*q = ", 2 * q, "). ",
+             "Higher-order cumulants (kappa_3, kappa_4, ...) will fall back to 0 ",
+             "(assumes normality). Consider using more indicators per factor ",
+             "or error.dist = \"normal\".")
+  }
+
   # Iteratively estimate kappa_k for k = 3, 4, ..., max_order
   # At each step, compute E[v_i^k] and subtract known lower-order contributions
   for (k in 3:max_order) {
@@ -334,8 +401,10 @@ estimateErrorMoments <- function(W, Lambda, Theta, v, factor_names,
     kappa_k <- tryCatch(
       as.vector(solve(crossprod(A_k), crossprod(A_k, s_k_adj))),
       error = function(e) {
-        warning2("Could not estimate order-", k, " cumulants of measurement errors. ",
-                 "Falling back to 0.")
+        warning2("Could not estimate order-", k,
+                 " cumulants of measurement errors ",
+                 "(rank(C^k) too low; need more indicators per factor). ",
+                 "Falling back to 0 (assumes normality for this order).")
         rep(0, p)
       }
     )

@@ -128,13 +128,20 @@ modsem_2smm <- function(model.syntax,
     error.dist = error.dist
   )
 
-  # Create error_moment_fn closure: given a multi-index s (named integer vector),
-  # return E[prod e_l^{s_l}] using the estimated eps_cumulants and W
+  # Create memoized error_moment_fn closure: given a multi-index s (named
+  # integer vector), return E[prod e_l^{s_l}] using the estimated
+  # eps_cumulants and W. Results are cached to avoid recomputing expensive
+  # set-partition-based joint moments.
   W_mat <- stage1$W
   eps_cumulants <- errMom$eps_cumulants
   factor_names_ordered <- stage1$factor_names
+  .emf_cache <- new.env(hash = TRUE, parent = emptyenv())
 
   error_moment_fn <- function(s) {
+    key <- paste(s, collapse = ",")
+    if (exists(key, envir = .emf_cache)) {
+      return(get(key, envir = .emf_cache))
+    }
     # Expand multi-index s into a vector of factor indices
     idx_vec <- integer(0)
     for (l in seq_along(s)) {
@@ -142,7 +149,9 @@ modsem_2smm <- function(model.syntax,
         idx_vec <- c(idx_vec, rep(l, s[l]))
       }
     }
-    compute_error_joint_moment(idx_vec, W_mat, eps_cumulants)
+    val <- compute_error_joint_moment(idx_vec, W_mat, eps_cumulants)
+    assign(key, val, envir = .emf_cache)
+    val
   }
 
   # ---- Stage 2: Bias-corrected regression for each eta ----
