@@ -61,6 +61,7 @@ estimate2SMM_stage1 <- function(syntaxCFA, data, lvs, ...) {
     Sigma_ee = Sigma_ee,
     W = W,
     v = v,
+    Z = Z,
     factor_names = lvs,
     indicator_names = indicator_names,
     n = nrow(Z)
@@ -540,7 +541,11 @@ estimate2SMM_stage2 <- function(f_hat, Sigma_ee, eta_name,
 # ===========================================================================
 
 # Compute sandwich standard errors for 2SMM
-compute2SMMSE <- function(alpha_hat, M_hat_inv, R, f_eta, n) {
+# If C_hat and T_hat are provided, use the full sandwich:
+#   Ω = Ω* + Ĉ T̂ Ĉ'  (Wall & Amemiya 2000, 2003)
+# Otherwise, fall back to Ω = Ω* (Stage 2 only).
+compute2SMMSE <- function(alpha_hat, M_hat_inv, R, f_eta, n,
+                           C_hat = NULL, T_hat = NULL) {
   # Residuals
   e_hat <- f_eta - R %*% alpha_hat
 
@@ -549,12 +554,19 @@ compute2SMMSE <- function(alpha_hat, M_hat_inv, R, f_eta, n) {
   ell <- as.vector(e_hat) * R
   Omega_star <- crossprod(ell) / n
 
-  # V(alpha) = (1/n) M_hat^{-1} Omega* M_hat^{-1}
-  vcov_alpha <- (M_hat_inv %*% Omega_star %*% M_hat_inv) / n
+  # Full sandwich meat
+  if (!is.null(C_hat) && !is.null(T_hat)) {
+    Omega <- Omega_star + C_hat %*% T_hat %*% t(C_hat)
+  } else {
+    Omega <- Omega_star
+  }
+
+  # V(alpha) = (1/n) M_hat^{-1} Omega M_hat^{-1}
+  vcov_alpha <- (M_hat_inv %*% Omega %*% M_hat_inv) / n
   se <- sqrt(pmax(diag(vcov_alpha), 0))
   names(se) <- names(alpha_hat)
 
-  list(vcov = vcov_alpha, se = se, Omega_star = Omega_star,
+  list(vcov = vcov_alpha, se = se, Omega_star = Omega_star, Omega = Omega,
        residuals = as.vector(e_hat))
 }
 
@@ -625,4 +637,193 @@ build2SMMParTable <- function(cfa_fit, alpha_hat, se_alpha, eta_name,
   rownames(parTable) <- NULL
 
   parTable
+}
+
+
+# ===========================================================================
+# Full sandwich SE correction: Ω = Ω* + Ĉ T̂ Ĉ'
+# (Wall & Amemiya 2000, 2003)
+# ===========================================================================
+
+# Get CFA parameters relevant to factor score computation (Lambda, nu, Theta).
+# Psi (factor covariance) does not affect Bartlett factor scores, so we skip it.
+# Returns a data.frame with columns: matrix, row, col, par_idx, est
+get_cfa_relevant_params <- function(cfa_fit) {
+  free_mats <- lavaan::lavInspect(cfa_fit, "free")
+  est_mats  <- lavaan::lavInspect(cfa_fit, "est")
+
+  # Matrices that affect factor scores: lambda, nu (intercepts), theta
+  relevant_matrices <- c("lambda", "nu", "theta")
+
+  params <- data.frame(
+    matrix  = character(0),
+    row     = integer(0),
+    col     = integer(0),
+    par_idx = integer(0),
+    est     = numeric(0),
+    stringsAsFactors = FALSE
+  )
+
+  for (mat_name in relevant_matrices) {
+    if (!mat_name %in% names(free_mats)) next
+    free_mat <- free_mats[[mat_name]]
+    est_mat  <- est_mats[[mat_name]]
+
+    # Find all free parameters (index > 0)
+    idx <- which(free_mat > 0, arr.ind = TRUE)
+    if (nrow(idx) == 0) next
+
+    for (k in seq_len(nrow(idx))) {
+      i <- idx[k, 1]
+      j <- idx[k, 2]
+      params <- rbind(params, data.frame(
+        matrix  = mat_name,
+        row     = i,
+        col     = j,
+        par_idx = free_mat[i, j],
+        est     = est_mat[i, j],
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+
+  # Sort by par_idx for consistent ordering
+  params <- params[order(params$par_idx), ]
+  rownames(params) <- NULL
+  params
+}
+
+
+# Reconstruct factor scores from perturbed CFA parameters.
+# param_info: data.frame from get_cfa_relevant_params()
+# param_values: numeric vector of perturbed parameter values (same length as nrow(param_info))
+# Z: n x p raw observed data matrix
+# lvs: character vector of latent variable names (in desired order)
+# base_Lambda, base_tau, base_Theta: baseline matrices (will be modified by perturbation)
+reconstruct_stage1_from_perturbed <- function(param_info, param_values,
+                                               Z, lvs,
+                                               base_Lambda, base_tau, base_Theta) {
+  Lambda <- base_Lambda
+  tau    <- base_tau
+  Theta  <- base_Theta
+
+  # Apply perturbed values
+
+  for (k in seq_len(nrow(param_info))) {
+    mat <- param_info$matrix[k]
+    i   <- param_info$row[k]
+    j   <- param_info$col[k]
+    val <- param_values[k]
+
+    if (mat == "lambda") {
+      Lambda[i, j] <- val
+    } else if (mat == "nu") {
+      tau[i] <- val
+    } else if (mat == "theta") {
+      Theta[i, j] <- val
+      Theta[j, i] <- val  # symmetric
+    }
+  }
+
+  # Recompute Bartlett factor scores
+  Theta_inv <- solve(Theta)
+  LtTiL     <- crossprod(Lambda, Theta_inv %*% Lambda)
+  Sigma_ee  <- solve(LtTiL)
+  W         <- Sigma_ee %*% crossprod(Lambda, Theta_inv)
+
+  Z_centered <- sweep(Z, 2, tau)
+  f_hat      <- Z_centered %*% t(W)
+  colnames(f_hat) <- colnames(Lambda)
+
+  # Reorder to match lvs
+  f_hat    <- f_hat[, lvs, drop = FALSE]
+  Sigma_ee <- Sigma_ee[lvs, lvs, drop = FALSE]
+  W        <- W[lvs, , drop = FALSE]
+
+  list(f_hat = f_hat, W = W, Sigma_ee = Sigma_ee)
+}
+
+
+# Compute observation-level estimating equation contributions:
+#   ℓ_t = ê_t * r_t
+# where ê_t = f_eta_t - r_t' α̂ (residual) and r_t is the regressor vector.
+# Returns an n x p_reg matrix of contributions.
+compute_ell_contributions <- function(f_hat, alpha_hat, reg_multiidx,
+                                       eta_name, factor_names) {
+  n     <- nrow(f_hat)
+  n_reg <- length(reg_multiidx)
+
+  # Build regressor matrix R
+  R <- matrix(0, nrow = n, ncol = n_reg)
+  R[, 1] <- 1  # intercept
+  for (j in seq_len(n_reg)[-1]) {
+    r_j    <- reg_multiidx[[j]]
+    active <- which(r_j > 0)
+    if (length(active) == 0) {
+      R[, j] <- 1
+    } else {
+      col <- rep(1, n)
+      for (l in active) {
+        col <- col * f_hat[, l]^r_j[l]
+      }
+      R[, j] <- col
+    }
+  }
+
+  # Residuals and contributions
+  f_eta <- f_hat[, eta_name]
+  e_hat <- f_eta - R %*% alpha_hat
+  ell   <- as.vector(e_hat) * R  # n x n_reg
+
+  ell
+}
+
+
+# Compute Ĉ matrix via central finite differences.
+# Ĉ[j, m] = (1/n) Σ_t [ℓ_t^j(θ+h·e_m) - ℓ_t^j(θ-h·e_m)] / (2h)
+#
+# Returns a p_reg x M matrix where p_reg = number of regressors,
+# M = number of relevant CFA parameters.
+compute_C_hat <- function(stage1, alpha_hat, reg_multiidx,
+                           eta_name, factor_names, lvs,
+                           param_info, h_scale = 1e-5) {
+  n     <- stage1$n
+  M     <- nrow(param_info)
+  n_reg <- length(reg_multiidx)
+
+  base_values <- param_info$est
+  C_hat <- matrix(0, nrow = n_reg, ncol = M)
+
+  for (m in seq_len(M)) {
+    h <- max(abs(base_values[m]), 1) * h_scale
+
+    # Perturb +h
+    vals_plus     <- base_values
+    vals_plus[m]  <- vals_plus[m] + h
+
+    stage1_plus <- reconstruct_stage1_from_perturbed(
+      param_info, vals_plus, stage1$Z, lvs,
+      stage1$Lambda, stage1$tau, stage1$Theta
+    )
+    ell_plus <- compute_ell_contributions(
+      stage1_plus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names
+    )
+
+    # Perturb -h
+    vals_minus     <- base_values
+    vals_minus[m]  <- vals_minus[m] - h
+
+    stage1_minus <- reconstruct_stage1_from_perturbed(
+      param_info, vals_minus, stage1$Z, lvs,
+      stage1$Lambda, stage1$tau, stage1$Theta
+    )
+    ell_minus <- compute_ell_contributions(
+      stage1_minus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names
+    )
+
+    # Central difference: Ĉ_m = (1/n) Σ_t [ℓ_t(θ+h) - ℓ_t(θ-h)] / (2h)
+    C_hat[, m] <- colMeans(ell_plus - ell_minus) / (2 * h)
+  }
+
+  C_hat
 }

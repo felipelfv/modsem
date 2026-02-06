@@ -154,6 +154,26 @@ modsem_2smm <- function(model.syntax,
     val
   }
 
+  # ---- Full sandwich SE: extract CFA parameter info and T̂ ----
+  if (verbose) cat("Computing full sandwich SE correction (Stage 1 uncertainty)...\n")
+  param_info <- get_cfa_relevant_params(stage1$cfa_fit)
+  M_cfa <- nrow(param_info)
+
+  # T̂ = asymptotic covariance of CFA parameters (from lavaan), subsetted
+  # to the relevant parameters (Lambda, nu, Theta only)
+  T_hat <- NULL
+  if (M_cfa > 0) {
+    full_vcov <- lavaan::vcov(stage1$cfa_fit)
+    # lavaan::vcov orders by par_idx; param_info$par_idx gives us the indices
+    T_hat <- full_vcov[param_info$par_idx, param_info$par_idx, drop = FALSE]
+    # Scale: lavaan::vcov gives V/n (already asymptotic), but we need
+    # n * Var(theta_hat) for the sandwich since our Ĉ is (1/n) Σ ∂ℓ/∂θ
+    # and V(α̂) = (1/n) M⁻¹ Ω M⁻¹ where Ω = Ω* + Ĉ T̂ Ĉ'.
+    # lavaan::vcov() returns Var(θ̂) = ACOV/n, so n * lavaan::vcov() = ACOV.
+    # Our Ĉ is O(1), Ω* is O(1), so T̂ must be O(1) too → T̂ = n * vcov.
+    T_hat <- stage1$n * T_hat
+  }
+
   # ---- Stage 2: Bias-corrected regression for each eta ----
   if (verbose) cat("Stage 2: Bias-corrected method-of-moments regression...\n")
 
@@ -180,12 +200,35 @@ modsem_2smm <- function(model.syntax,
       factor_names = factor_names_ordered
     )
 
+    # Compute Ĉ for the full sandwich correction
+    C_hat_eta <- NULL
+    if (M_cfa > 0 && !is.null(T_hat)) {
+      reg_multiidx <- lapply(
+        c("(Intercept)", linear_preds, eta_ints),
+        term_to_multiindex,
+        factor_names = factor_names_ordered
+      )
+      names(reg_multiidx) <- c("(Intercept)", linear_preds, eta_ints)
+
+      C_hat_eta <- compute_C_hat(
+        stage1      = stage1,
+        alpha_hat   = stage2$alpha_hat,
+        reg_multiidx = reg_multiidx,
+        eta_name    = eta,
+        factor_names = factor_names_ordered,
+        lvs         = lvs,
+        param_info  = param_info
+      )
+    }
+
     se_info <- compute2SMMSE(
       alpha_hat = stage2$alpha_hat,
       M_hat_inv = stage2$M_hat_inv,
       R = stage2$R,
       f_eta = stage2$f_eta,
-      n = stage1$n
+      n = stage1$n,
+      C_hat = C_hat_eta,
+      T_hat = T_hat
     )
 
     all_alpha[[eta]] <- list(
