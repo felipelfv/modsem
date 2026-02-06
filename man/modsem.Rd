@@ -22,6 +22,7 @@ modsem(model.syntax = NULL, data = NULL, method = "dblcent", ...)
   \item{\code{"qml"}}{quasi maximum likelihood estimation (not passed to \code{lavaan}).}
   \item{\code{"custom"}}{use parameters specified in the function call (passed to \code{lavaan}).}
   \item{\code{"mplus"}}{estimate model through \code{Mplus}.}
+  \item{\code{"2smm"}}{two-stage method of moments (Wall & Amemiya 2000, 2003).}
 }}
 
 \item{...}{arguments passed to other functions depending on the method (see \code{\link{modsem_pi}}, \code{\link{modsem_da}}, and \code{\link{modsem_mplus}})}

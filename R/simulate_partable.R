@@ -67,9 +67,7 @@ simulateDataParTableGroup <- function(parTable, N, colsOVs = NULL, colsLVs = NUL
   intTermRows <- getIntTermRows(parTable)
   varsIntTerms <- getVarsInts(intTermRows, removeColonNames = FALSE)
 
-  stopif(any(vapply(varsIntTerms, FUN.VALUE = numeric(1L), FUN = length) > 2),
-         "Cannot simulate data for interaction effects with more than two ",
-         "components, yet")
+  # Arbitrary-degree interaction terms are now supported
 
   # simulate data for xis
   phi <- rmvnormParTable(parTable, type = "phi", N = N)
@@ -162,7 +160,7 @@ mutliplyPairs <- function(X, XZ) {
   for (i in seq_len(length(XZ))) {
     col <- names(XZ)[[i]]
     xz <- XZ[[i]]
-    prods[, col] <- X[ , xz[[1]]] * X[ , xz[[2]]]
+    prods[, col] <- Reduce("*", lapply(xz, function(v) X[, v]))
   }
   prods
 }

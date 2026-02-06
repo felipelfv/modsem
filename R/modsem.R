@@ -1,6 +1,7 @@
 PI_METHODS   = c("rca", "uca", "dblcent", "pind", "ca", "custom")
 DA_METHODS   = c("lms", "qml")
 MPLUS_METHOD = "mplus"
+TSMM_METHOD  = "2smm"
 
 
 #' Estimate interaction effects in structural equation models (SEMs)
@@ -20,6 +21,7 @@ MPLUS_METHOD = "mplus"
 #'   \item{\code{"qml"}}{quasi maximum likelihood estimation (not passed to \code{lavaan}).}
 #'   \item{\code{"custom"}}{use parameters specified in the function call (passed to \code{lavaan}).}
 #'   \item{\code{"mplus"}}{estimate model through \code{Mplus}.}
+#'   \item{\code{"2smm"}}{two-stage method of moments (Wall & Amemiya 2000, 2003).}
 #' }
 #'
 #' @param ... arguments passed to other functions depending on the method (see \code{\link{modsem_pi}}, \code{\link{modsem_da}}, and \code{\link{modsem_mplus}})
@@ -135,6 +137,8 @@ modsem <- function(model.syntax = NULL,
     modsem_da(model.syntax, data = data, method = method, ...)
   } else if (method == MPLUS_METHOD) {
     modsem_mplus(model.syntax, data = data, ...)
+  } else if (method == TSMM_METHOD) {
+    modsem_2smm(model.syntax, data = data, ...)
   } else {
     stop2("Method not recognized")
   }
