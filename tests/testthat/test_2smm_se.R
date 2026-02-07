@@ -168,7 +168,8 @@ test_indices <- list(
 memo_ub <- new.env(hash = TRUE, parent = emptyenv())
 for (midx in test_indices) {
   memo_bc <- new.env(hash = TRUE, parent = emptyenv())
-  bc_vec <- compute_bc_individual(midx, stage1$f_hat, error_moment_fn, memo_bc)
+  memo_sc <- new.env(hash = TRUE, parent = emptyenv())
+  bc_vec <- compute_bc_individual(midx, stage1$f_hat, error_moment_fn, memo_bc, memo_sc)
   ub_val <- unbiased_moment(midx, stage1$f_hat, error_moment_fn, memo_ub)
   testthat::expect_equal(mean(bc_vec), ub_val, tolerance = 1e-12)
 }

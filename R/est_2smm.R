@@ -337,7 +337,7 @@ unbiased_moment <- function(r, f_hat, error_moment_fn, memo) {
 # instead of a scalar mean:
 #   bc_t(r) = raw_product_t(r) - SUM_{0<s<=r, |s|>=2} C(r,s) * mu_e(s) * bc_t(r-s)
 # For sum(r)=0: rep(1,n). For sum(r)=1: raw product (no correction).
-compute_bc_individual <- function(r, f_hat, error_moment_fn, memo) {
+compute_bc_individual <- function(r, f_hat, error_moment_fn, memo, memo_scalar) {
   key <- paste(r, collapse = ",")
   if (exists(key, envir = memo)) return(get(key, envir = memo))
 
@@ -369,7 +369,10 @@ compute_bc_individual <- function(r, f_hat, error_moment_fn, memo) {
   all_s <- as.matrix(expand.grid(grid_list))
   colnames(all_s) <- names(r)
 
-  correction <- rep(0, n)
+  # Correction uses SCALAR unbiased_moment(r-s) so that only the raw product
+  # varies per observation.  This avoids spurious cross-correlations in the
+  # ell_t vector that shrink the sandwich meat Omega_star at high orders.
+  correction <- 0  # scalar, broadcast to all obs
   for (row_idx in seq_len(nrow(all_s))) {
     s <- all_s[row_idx, ]
     s_sum <- sum(s)
@@ -380,15 +383,15 @@ compute_bc_individual <- function(r, f_hat, error_moment_fn, memo) {
     if (abs(mu_e_s) < 1e-30) next
 
     if (all(s == r)) {
-      # When s == r, bc_{r-s} = bc_0 = rep(1,n), C(r,s) = 1
+      # When s == r, U(r-s) = U(0) = 1, C(r,s) = 1
       correction <- correction + mu_e_s
       next
     }
 
     C_rs <- prod(vapply(seq_len(q), function(l) choose(r[l], s[l]), numeric(1)))
     r_minus_s <- r - s
-    bc_rms <- compute_bc_individual(r_minus_s, f_hat, error_moment_fn, memo)
-    correction <- correction + C_rs * mu_e_s * bc_rms
+    U_rms <- unbiased_moment(r_minus_s, f_hat, error_moment_fn, memo_scalar)
+    correction <- correction + C_rs * mu_e_s * U_rms
   }
 
   result <- raw_vec - correction
@@ -412,7 +415,8 @@ compute_bc_ell <- function(f_hat, alpha_hat, reg_multiidx,
   names(eta_midx) <- factor_names
   eta_midx[eta_name] <- 1L
 
-  memo <- new.env(hash = TRUE, parent = emptyenv())
+  memo        <- new.env(hash = TRUE, parent = emptyenv())
+  memo_scalar <- new.env(hash = TRUE, parent = emptyenv())
 
   ell <- matrix(0, nrow = n, ncol = n_reg)
 
@@ -420,13 +424,14 @@ compute_bc_ell <- function(f_hat, alpha_hat, reg_multiidx,
     r_j <- reg_multiidx[[j]]
 
     # m_hat_t[j] = bc_t(r_j + r_eta)
-    m_hat_j <- compute_bc_individual(r_j + eta_midx, f_hat, error_moment_fn, memo)
+    m_hat_j <- compute_bc_individual(r_j + eta_midx, f_hat, error_moment_fn,
+                                      memo, memo_scalar)
 
     # sum_k alpha_hat[k] * bc_t(r_j + r_k)
     M_alpha_j <- rep(0, n)
     for (k in seq_len(n_reg)) {
       bc_jk <- compute_bc_individual(r_j + reg_multiidx[[k]], f_hat,
-                                      error_moment_fn, memo)
+                                      error_moment_fn, memo, memo_scalar)
       M_alpha_j <- M_alpha_j + alpha_hat[k] * bc_jk
     }
 
