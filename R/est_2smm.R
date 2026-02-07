@@ -332,6 +332,111 @@ unbiased_moment <- function(r, f_hat, error_moment_fn, memo) {
 }
 
 
+# Individual-level bias-corrected contributions (n-vector per multi-index r).
+# Same recursion as unbiased_moment() but returns one value per observation
+# instead of a scalar mean:
+#   bc_t(r) = raw_product_t(r) - SUM_{0<s<=r, |s|>=2} C(r,s) * mu_e(s) * bc_t(r-s)
+# For sum(r)=0: rep(1,n). For sum(r)=1: raw product (no correction).
+compute_bc_individual <- function(r, f_hat, error_moment_fn, memo) {
+  key <- paste(r, collapse = ",")
+  if (exists(key, envir = memo)) return(get(key, envir = memo))
+
+  n <- nrow(f_hat)
+  total_order <- sum(r)
+
+  if (total_order == 0) {
+    result <- rep(1, n)
+    assign(key, result, envir = memo)
+    return(result)
+  }
+
+  # Raw product vector: prod_{l: r_l > 0} f_hat[,l]^r_l
+  active <- which(r > 0)
+  raw_vec <- rep(1, n)
+  for (l in active) {
+    raw_vec <- raw_vec * f_hat[, l]^r[l]
+  }
+
+  if (total_order == 1) {
+    # No correction: E[e] = 0, so all corrections require |s| >= 2 > total_order
+    assign(key, raw_vec, envir = memo)
+    return(raw_vec)
+  }
+
+  # Enumerate all sub-indices s with 0 <= s_l <= r_l, excluding s = 0
+  q <- length(r)
+  grid_list <- lapply(r, function(ri) 0:ri)
+  all_s <- as.matrix(expand.grid(grid_list))
+  colnames(all_s) <- names(r)
+
+  correction <- rep(0, n)
+  for (row_idx in seq_len(nrow(all_s))) {
+    s <- all_s[row_idx, ]
+    s_sum <- sum(s)
+    if (s_sum == 0) next
+    if (s_sum == 1) next  # E[e_a] = 0
+
+    mu_e_s <- error_moment_fn(s)
+    if (abs(mu_e_s) < 1e-30) next
+
+    if (all(s == r)) {
+      # When s == r, bc_{r-s} = bc_0 = rep(1,n), C(r,s) = 1
+      correction <- correction + mu_e_s
+      next
+    }
+
+    C_rs <- prod(vapply(seq_len(q), function(l) choose(r[l], s[l]), numeric(1)))
+    r_minus_s <- r - s
+    bc_rms <- compute_bc_individual(r_minus_s, f_hat, error_moment_fn, memo)
+    correction <- correction + C_rs * mu_e_s * bc_rms
+  }
+
+  result <- raw_vec - correction
+  assign(key, result, envir = memo)
+  result
+}
+
+
+# Compute bias-corrected ell matrix (Paper Eq 13-14):
+#   ell_t[j] = m_hat_t[j] - sum_k M_hat_t[j,k] * alpha_hat[k]
+# where m_hat_t[j] = bc_t(r_j + r_eta) and M_hat_t[j,k] = bc_t(r_j + r_k)
+# are individual-level bias-corrected contributions.
+# Returns n x n_reg matrix.
+compute_bc_ell <- function(f_hat, alpha_hat, reg_multiidx,
+                            eta_name, factor_names, error_moment_fn) {
+  n     <- nrow(f_hat)
+  q     <- length(factor_names)
+  n_reg <- length(reg_multiidx)
+
+  eta_midx <- integer(q)
+  names(eta_midx) <- factor_names
+  eta_midx[eta_name] <- 1L
+
+  memo <- new.env(hash = TRUE, parent = emptyenv())
+
+  ell <- matrix(0, nrow = n, ncol = n_reg)
+
+  for (j in seq_len(n_reg)) {
+    r_j <- reg_multiidx[[j]]
+
+    # m_hat_t[j] = bc_t(r_j + r_eta)
+    m_hat_j <- compute_bc_individual(r_j + eta_midx, f_hat, error_moment_fn, memo)
+
+    # sum_k alpha_hat[k] * bc_t(r_j + r_k)
+    M_alpha_j <- rep(0, n)
+    for (k in seq_len(n_reg)) {
+      bc_jk <- compute_bc_individual(r_j + reg_multiidx[[k]], f_hat,
+                                      error_moment_fn, memo)
+      M_alpha_j <- M_alpha_j + alpha_hat[k] * bc_jk
+    }
+
+    ell[, j] <- m_hat_j - M_alpha_j
+  }
+
+  ell
+}
+
+
 # ===========================================================================
 # Generalized error moment estimation
 # ===========================================================================
@@ -445,6 +550,29 @@ estimateErrorMoments <- function(W, Lambda, Theta, v, factor_names,
 }
 
 
+# Factory function to create a memoized error moment function.
+# Given W (weight matrix) and eps_cumulants (list of cumulant vectors),
+# returns a function(s) that computes E[prod e_l^{s_l}] with caching.
+make_error_moment_fn <- function(W, eps_cumulants) {
+  cache <- new.env(hash = TRUE, parent = emptyenv())
+  function(s) {
+    key <- paste(s, collapse = ",")
+    if (exists(key, envir = cache)) {
+      return(get(key, envir = cache))
+    }
+    idx_vec <- integer(0)
+    for (l in seq_along(s)) {
+      if (s[l] > 0) {
+        idx_vec <- c(idx_vec, rep(l, s[l]))
+      }
+    }
+    val <- compute_error_joint_moment(idx_vec, W, eps_cumulants)
+    assign(key, val, envir = cache)
+    val
+  }
+}
+
+
 # ===========================================================================
 # Stage 2: Generalized bias-corrected method-of-moments regression
 # ===========================================================================
@@ -545,13 +673,15 @@ estimate2SMM_stage2 <- function(f_hat, Sigma_ee, eta_name,
 #   Ω = Ω* + Ĉ T̂ Ĉ'  (Wall & Amemiya 2000, 2003)
 # Otherwise, fall back to Ω = Ω* (Stage 2 only).
 compute2SMMSE <- function(alpha_hat, M_hat_inv, R, f_eta, n,
-                           C_hat = NULL, T_hat = NULL) {
-  # Residuals
+                           C_hat = NULL, T_hat = NULL, ell = NULL) {
+  # Residuals (always computed for variance estimation output)
   e_hat <- f_eta - R %*% alpha_hat
 
-  # Observation-level estimating equation: ell_t = e_t * r_t
-  # Omega* = (1/n) sum(e_t^2 * r_t r_t')
-  ell <- as.vector(e_hat) * R
+  # Omega* from ell contributions
+  if (is.null(ell)) {
+    # Fallback: raw ell = e_hat * R
+    ell <- as.vector(e_hat) * R
+  }
   Omega_star <- crossprod(ell) / n
 
   # Full sandwich meat
@@ -740,16 +870,23 @@ reconstruct_stage1_from_perturbed <- function(param_info, param_values,
   Sigma_ee <- Sigma_ee[lvs, lvs, drop = FALSE]
   W        <- W[lvs, , drop = FALSE]
 
-  list(f_hat = f_hat, W = W, Sigma_ee = Sigma_ee)
+  list(f_hat = f_hat, W = W, Sigma_ee = Sigma_ee, Theta = Theta)
 }
 
 
-# Compute observation-level estimating equation contributions:
-#   ℓ_t = ê_t * r_t
-# where ê_t = f_eta_t - r_t' α̂ (residual) and r_t is the regressor vector.
+# Compute observation-level estimating equation contributions.
+# If error_moment_fn is provided, uses the exact bias-corrected formulation
+# (Paper Eq 13-14): ℓ_t = m̂_t - M̂_t α̂
+# Otherwise falls back to the raw approximation: ℓ_t = ê_t * r_t
 # Returns an n x p_reg matrix of contributions.
 compute_ell_contributions <- function(f_hat, alpha_hat, reg_multiidx,
-                                       eta_name, factor_names) {
+                                       eta_name, factor_names,
+                                       error_moment_fn = NULL) {
+  if (!is.null(error_moment_fn)) {
+    return(compute_bc_ell(f_hat, alpha_hat, reg_multiidx,
+                          eta_name, factor_names, error_moment_fn))
+  }
+
   n     <- nrow(f_hat)
   n_reg <- length(reg_multiidx)
 
@@ -786,7 +923,8 @@ compute_ell_contributions <- function(f_hat, alpha_hat, reg_multiidx,
 # M = number of relevant CFA parameters.
 compute_C_hat <- function(stage1, alpha_hat, reg_multiidx,
                            eta_name, factor_names, lvs,
-                           param_info, h_scale = 1e-5) {
+                           param_info, h_scale = 1e-5,
+                           eps_cumulants = NULL) {
   n     <- stage1$n
   M     <- nrow(param_info)
   n_reg <- length(reg_multiidx)
@@ -805,8 +943,18 @@ compute_C_hat <- function(stage1, alpha_hat, reg_multiidx,
       param_info, vals_plus, stage1$Z, lvs,
       stage1$Lambda, stage1$tau, stage1$Theta
     )
+
+    # Build perturbed error_moment_fn if eps_cumulants provided
+    emf_plus <- NULL
+    if (!is.null(eps_cumulants)) {
+      eps_cum_plus <- eps_cumulants
+      eps_cum_plus[[2]] <- diag(stage1_plus$Theta)
+      emf_plus <- make_error_moment_fn(stage1_plus$W, eps_cum_plus)
+    }
+
     ell_plus <- compute_ell_contributions(
-      stage1_plus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names
+      stage1_plus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names,
+      error_moment_fn = emf_plus
     )
 
     # Perturb -h
@@ -817,8 +965,17 @@ compute_C_hat <- function(stage1, alpha_hat, reg_multiidx,
       param_info, vals_minus, stage1$Z, lvs,
       stage1$Lambda, stage1$tau, stage1$Theta
     )
+
+    emf_minus <- NULL
+    if (!is.null(eps_cumulants)) {
+      eps_cum_minus <- eps_cumulants
+      eps_cum_minus[[2]] <- diag(stage1_minus$Theta)
+      emf_minus <- make_error_moment_fn(stage1_minus$W, eps_cum_minus)
+    }
+
     ell_minus <- compute_ell_contributions(
-      stage1_minus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names
+      stage1_minus$f_hat, alpha_hat, reg_multiidx, eta_name, factor_names,
+      error_moment_fn = emf_minus
     )
 
     # Central difference: Ĉ_m = (1/n) Σ_t [ℓ_t(θ+h) - ℓ_t(θ-h)] / (2h)

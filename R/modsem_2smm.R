@@ -128,31 +128,10 @@ modsem_2smm <- function(model.syntax,
     error.dist = error.dist
   )
 
-  # Create memoized error_moment_fn closure: given a multi-index s (named
-  # integer vector), return E[prod e_l^{s_l}] using the estimated
-  # eps_cumulants and W. Results are cached to avoid recomputing expensive
-  # set-partition-based joint moments.
-  W_mat <- stage1$W
+  # Create memoized error_moment_fn via factory
   eps_cumulants <- errMom$eps_cumulants
   factor_names_ordered <- stage1$factor_names
-  .emf_cache <- new.env(hash = TRUE, parent = emptyenv())
-
-  error_moment_fn <- function(s) {
-    key <- paste(s, collapse = ",")
-    if (exists(key, envir = .emf_cache)) {
-      return(get(key, envir = .emf_cache))
-    }
-    # Expand multi-index s into a vector of factor indices
-    idx_vec <- integer(0)
-    for (l in seq_along(s)) {
-      if (s[l] > 0) {
-        idx_vec <- c(idx_vec, rep(l, s[l]))
-      }
-    }
-    val <- compute_error_joint_moment(idx_vec, W_mat, eps_cumulants)
-    assign(key, val, envir = .emf_cache)
-    val
-  }
+  error_moment_fn <- make_error_moment_fn(stage1$W, eps_cumulants)
 
   # ---- Full sandwich SE: extract CFA parameter info and T̂ ----
   if (verbose) cat("Computing full sandwich SE correction (Stage 1 uncertainty)...\n")
@@ -200,24 +179,32 @@ modsem_2smm <- function(model.syntax,
       factor_names = factor_names_ordered
     )
 
+    # Build reg_multiidx (needed for both bc_ell and C_hat)
+    reg_multiidx <- lapply(
+      c("(Intercept)", linear_preds, eta_ints),
+      term_to_multiindex,
+      factor_names = factor_names_ordered
+    )
+    names(reg_multiidx) <- c("(Intercept)", linear_preds, eta_ints)
+
+    # Compute bias-corrected ell for Omega*
+    bc_ell <- compute_bc_ell(
+      stage1$f_hat, stage2$alpha_hat, reg_multiidx,
+      eta, factor_names_ordered, error_moment_fn
+    )
+
     # Compute Ĉ for the full sandwich correction
     C_hat_eta <- NULL
     if (M_cfa > 0 && !is.null(T_hat)) {
-      reg_multiidx <- lapply(
-        c("(Intercept)", linear_preds, eta_ints),
-        term_to_multiindex,
-        factor_names = factor_names_ordered
-      )
-      names(reg_multiidx) <- c("(Intercept)", linear_preds, eta_ints)
-
       C_hat_eta <- compute_C_hat(
-        stage1      = stage1,
-        alpha_hat   = stage2$alpha_hat,
+        stage1       = stage1,
+        alpha_hat    = stage2$alpha_hat,
         reg_multiidx = reg_multiidx,
-        eta_name    = eta,
+        eta_name     = eta,
         factor_names = factor_names_ordered,
-        lvs         = lvs,
-        param_info  = param_info
+        lvs          = lvs,
+        param_info   = param_info,
+        eps_cumulants = eps_cumulants
       )
     }
 
@@ -228,7 +215,8 @@ modsem_2smm <- function(model.syntax,
       f_eta = stage2$f_eta,
       n = stage1$n,
       C_hat = C_hat_eta,
-      T_hat = T_hat
+      T_hat = T_hat,
+      ell = bc_ell
     )
 
     all_alpha[[eta]] <- list(
