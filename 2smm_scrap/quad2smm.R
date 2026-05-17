@@ -2,6 +2,9 @@
 # further check the analytical SEs for the unspecified distribution case for var_e(e)
 # prpbably also compare to LSAM as they should be relatively identical except when e's are non-normal
 
+# 17/05/26: both SEs are the same when varying e's normal and non-normal
+# not sure why so double check
+
 library(lavaan); library(MASS)
 
 quad2smm_true_params <- function() {
@@ -28,10 +31,23 @@ quad2smm_true_params <- function() {
   )
 }
 
-quad2smm_simulate <- function(n, p) {
+# mean-0, var-1 draws so the ps* scaling stays correct under any err_dist
+draw_err <- function(n, dist) {
+  switch(dist,
+    normal = rnorm(n),
+    exp1   = rexp(n, rate = 1) - 1,
+    chisq4 = (rchisq(n, df = 4) - 4) / sqrt(8),
+    stop("unknown err_dist: ", dist)
+  )
+}
+
+# err_dist length-4 (or scalar, recycled): zeta on Y4, u on Y1, a on Y2, e on Y3
+quad2smm_simulate <- function(n, p, err_dist = "normal") {
+  err_dist <- rep_len(err_dist, 4)
   y1u <- runif(n)
   y1  <- sqrt(12) * (y1u - 0.5) # uniform on [-sqrt(3), sqrt(3)]
-  x   <- matrix(rnorm(4 * n), n, 4)
+  x   <- vapply(err_dist, draw_err, numeric(n), n = n)
+  if (!is.matrix(x)) x <- matrix(x, n, 4)
 
   f1 <- p$mf1 + p$ph1 * y1
   Y1 <- f1 + p$ps1 * x[, 2]
@@ -405,7 +421,7 @@ quad2smm_structural <- function(Data, mpar, n) {
 }
 
 quad2smm_run <- function(n_reps = 1000, n = 500, seed = 1234,
-                          verbose = TRUE) {
+                          err_dist = "normal", verbose = TRUE) {
   set.seed(seed)
   p <- quad2smm_true_params()
 
@@ -421,7 +437,7 @@ quad2smm_run <- function(n_reps = 1000, n = 500, seed = 1234,
                 dimnames = list(NULL, col_names))
 
   for (r in seq_len(n_reps)) {
-    dat <- quad2smm_simulate(n, p)
+    dat <- quad2smm_simulate(n, p, err_dist = err_dist)
     fit <- tryCatch(quad2smm_fit_meas(dat), error = function(e) NULL)
     if (is.null(fit) || !lavaan::lavInspect(fit, "converged")) {
       if (verbose) cat(sprintf("rep %d: measurement model failed\n", r))
@@ -440,3 +456,30 @@ quad2smm_run <- function(n_reps = 1000, n = 500, seed = 1234,
   }
   as.data.frame(out)
 }
+
+# avg analytical SE / MC sd for the three structural coefs, both SE 
+quad2smm_ratios <- function(res) {
+  mc_sd  <- apply(res, 2, sd, na.rm = TRUE)
+  avg_se <- colMeans(res[, c("segamn0","segamn1","segamn2",
+                             "segam0_rob","segam1_rob","segam2_rob")],
+                     na.rm = TRUE)
+  nonrob <- c(avg_se["segamn0"]    / mc_sd["gamn0"],
+              avg_se["segamn1"]    / mc_sd["gamn1"],
+              avg_se["segamn2"]    / mc_sd["gamn2"])
+  rob    <- c(avg_se["segam0_rob"] / mc_sd["bhat0"],
+              avg_se["segam1_rob"] / mc_sd["bhat1"],
+              avg_se["segam2_rob"] / mc_sd["bhat2"])
+  out <- rbind(nonrob = unname(nonrob), rob = unname(rob))
+  colnames(out) <- c("gam0", "gam1", "gam2")
+  out
+}
+
+# normal vs non-normal e 
+res_norm <- quad2smm_run(n_reps = 1000, n = 500, seed = 1234,
+                         err_dist = "normal", verbose = FALSE)
+res_nne  <- quad2smm_run(n_reps = 1000, n = 500, seed = 1234,
+                         err_dist = c("normal","normal","normal","exp1"),
+                         verbose = FALSE)
+
+print(round(quad2smm_ratios(res_norm), 3))
+print(round(quad2smm_ratios(res_nne),  3))
